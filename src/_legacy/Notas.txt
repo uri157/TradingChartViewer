@@ -1,0 +1,3 @@
+Las consultas en dbEngine solo buscan datos en cache, falta optimizarlas para buscar en los historicos combinando indexes y algoritmos de busqueda eficientes
+Pasan siempre el mismo timestamp
+ON MIN PRICE LIMIT CHANGE FALLANDO EN GRIDVALUES

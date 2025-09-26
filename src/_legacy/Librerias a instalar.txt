@@ -1,0 +1,12 @@
+Los comandos en este archivo son para linux
+
+
+1- sfml
+--------------------------------------------------
+2- boost: 
+    sudo apt update
+    sudo apt install libboost-all-dev
+--------------------------------------------------
+3- OpenSSL y las librerías de desarrollo:
+    sudo apt update
+    sudo apt install libssl-dev

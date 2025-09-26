@@ -1,0 +1,94 @@
+# ===== Build artefacts =====
+/bin/
+/obj/
+/build/
+/dist/
+/out/
+/cache/
+
+# C/C++ compilation
+*.o
+*.obj
+*.lo
+*.la
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+*.d
+*.pch
+
+# Profilers / sanitizers / debug
+*.prof
+*.profraw
+*.gcda
+*.gcno
+*.gcov
+*.stackdump
+core
+vgcore.*
+massif.out.*
+callgrind.out.*
+cachegrind.out.*
+
+# Logs & runtime data
+*.log
+*.pid
+*.tmp
+*.temp
+
+# Project-specific generated data
+price_data*.bin
+price_data*.txt
+
+# Fonts & media (avoid committing licensed binaries; keep assets/ tracked if needed)
+Calibri.ttf
+*.ttf
+*.otf
+*.png
+*.jpg
+*.jpeg
+
+# IDE/editor junk
+.vscode/
+.idea/
+.vs/
+*.code-workspace
+*.suo
+*.user
+*.userossc
+*.sln.docstates
+*.ncb
+*.opt
+*.pdb
+*.idb
+*.ilk
+
+# Language servers / indexes
+.clangd/
+.clang-tidy
+.clang-format
+.ccls-cache/
+compile_commands.json
+
+# CMake (if ever used locally)
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+
+# OS-specific
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Icon?
+
+prompts.txt
