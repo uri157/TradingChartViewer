@@ -1,0 +1,133 @@
+asyncapi: 2.6.0
+info:
+  title: TheTradingViewer WebSocket API
+  version: 0.1.0
+  description: |
+    Difusión JSON de velas y eventos de resync desde `/ws`. El servidor no procesa
+    mensajes de texto enviados por clientes (frames ignorados). Mantiene la conexión
+    con pings WebSocket cada `wsPingPeriodMs` (default 30s) y cierra tras dos timeouts
+    consecutivos o 90s de inactividad. Ver src/api/WebSocketServer.cpp.
+defaultContentType: application/json
+servers:
+  production:
+    url: ws://localhost:8080/ws
+    protocol: ws
+    description: Servidor local por defecto
+  lan:
+    url: ws://{lan_ip}:8080/ws
+    protocol: ws
+    description: Servidor expuesto en red local
+    variables:
+      lan_ip:
+        default: 192.168.0.10
+        description: Reemplazar por IP LAN del host que ejecuta el backend
+channels:
+  stream:
+    description: |
+      Canal único de difusión. El servidor envía un `welcome` tras el handshake y luego
+      mensajes `candle` y `resync_done`. No se requiere mensaje de suscripción; todos los
+      clientes reciben el mismo flujo. Frames entrantes no se interpretan (TODO: confirmar
+      si habrá filtros por cliente; ver src/api/WebSocketServer.cpp:594-666).
+    publish:
+      summary: Mensajes que envía el servidor al cliente
+      message:
+        oneOf:
+          - $ref: '#/components/messages/Welcome'
+          - $ref: '#/components/messages/CandleEvent'
+          - $ref: '#/components/messages/ResyncDone'
+components:
+  messages:
+    Welcome:
+      name: Welcome
+      title: Mensaje de bienvenida
+      summary: Emitido una sola vez inmediatamente después de registrar la sesión.
+      payload:
+        $ref: '#/components/schemas/WelcomePayload'
+    CandleEvent:
+      name: CandleEvent
+      title: Vela cerrada
+      summary: Difusión de una vela cerrada proveniente de la ingesta en vivo.
+      payload:
+        $ref: '#/components/schemas/CandlePayload'
+      examples:
+        - payload:
+            type: candle
+            symbol: BTCUSDT
+            interval: 1m
+            data: [1735689600000, 42000.0, 42100.0, 41950.0, 42050.0, 12.34]
+          summary: TODO: confirmar valores con datos reales (ver src/app/LiveIngestor.cpp:96-133).
+    ResyncDone:
+      name: ResyncDone
+      title: Resync completado
+      summary: Emitido cuando la sincronización REST cargó velas históricas para símbolos.
+      payload:
+        $ref: '#/components/schemas/ResyncPayload'
+  schemas:
+    WelcomePayload:
+      type: object
+      additionalProperties: false
+      required: [event]
+      properties:
+        event:
+          type: string
+          const: welcome
+    CandlePayload:
+      type: object
+      additionalProperties: false
+      required: [type, symbol, interval, data]
+      properties:
+        type:
+          type: string
+          const: candle
+        symbol:
+          type: string
+        interval:
+          type: string
+          enum: [1m, 5m, 1h, 1d]
+        data:
+          $ref: '#/components/schemas/CandleTuple'
+    CandleTuple:
+      type: array
+      minItems: 6
+      maxItems: 6
+      prefixItems:
+        - type: integer
+          format: int64
+        - type: number
+        - type: number
+        - type: number
+        - type: number
+        - type: number
+      items: false
+      description: |
+        `[timestamp_ms, open, high, low, close, volume]`. El servidor normaliza el timestamp
+        a milisegundos si recibe segundos (ver src/app/LiveIngestor.cpp:96-133).
+    ResyncPayload:
+      type: object
+      additionalProperties: false
+      required: [type, interval, symbols]
+      properties:
+        type:
+          type: string
+          const: resync_done
+        interval:
+          type: string
+        symbols:
+          type: array
+          items:
+            type: string
+    CloseBehavior:
+      type: object
+      description: |
+        Documenta cierres de conexión activados por el servidor. No es un mensaje real,
+        sino referencia para integradores.
+      properties:
+        reason:
+          type: string
+          enum: [pong_timeout, inactivity, write_error, read_error, server_shutdown]
+        close_code:
+          type: integer
+          enum: [1000, 1001, 1006]
+        notes:
+          type: string
+      required: [reason, close_code]

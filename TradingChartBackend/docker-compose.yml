@@ -1,0 +1,30 @@
+services:
+  api:
+    image: ttv/api:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    # Flags comunes + CORS desde .env (compose inyecta variables)
+    command: [
+      "--live=1",
+      "--storage","duck",
+      "--duckdb","/data/market.duckdb",
+      "--exchange","binance",
+      "--live-symbols","BTCUSDT,ETHUSDT",
+      "--live-intervals","1m",
+      "--log-level","${LOG_LEVEL:-info}",
+      "--http.cors.enable=${CORS_ENABLE:-0}",
+      "--http.cors.origin","${CORS_ORIGIN:-}"
+    ]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  market_data:

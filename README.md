@@ -1,159 +1,349 @@
-Aquí tenés un README.md unificado y limpio (listo para pegar):
+# TradingChart — Architecture & Operations README
 
-```markdown
-# The Trading Project (TTP)
+> **Goal:** serve **financial price history** and **technical analysis tools** (OHLCV candles, indicators, time-series utilities) to a Next.js web app with low latency and high availability.
 
-TTP is a **C++17 desktop terminal** that renders streaming and historical cryptocurrency market data on an **interactive candlestick chart**. It combines **SFML**-based rendering with **Boost.Asio/Beast** and **OpenSSL** for network connectivity, pulling market data from Binance-style REST and WebSocket endpoints through a configurable dependency-injection bootstrap layer.
-
----
-
-## Key features
-
-- **Live and historical market synchronisation.** A `SyncOrchestrator` seeds local storage with REST backfills, streams live kline updates with exponential backoff, and republishes snapshots through the event bus whenever new candles arrive.
-- **Local persistence and in-memory caching.** `DatabaseEngine`, `PriceDataManager`, and `PriceDataTimeSeriesRepository` normalise, persist, and surface OHLCV data while a thread-safe `SeriesCache` provides fast snapshots for the renderer.
-- **Interactive charting UI.** The `ChartController` drives SFML rendering, handling pan/zoom input, backfill requests, cursor overlays, and the `RenderSnapshot` data model that powers axes, wicks, crosshairs, and indicator overlays. The grid scene augments the chart with a Matrix-style background and UI chrome.
-- **Indicator engine with warm-up reuse.** The indicator coordinator computes and caches EMA series, automatically fetching warm-up ranges and scheduling async recomputations to minimise redraw latency.
-- **Event-driven architecture.** A custom event bus propagates SFML input and series updates, enabling decoupled UI components and background workers to coordinate refreshes and backfills.
-- **Structured logging & diagnostics.** Category-aware logging with CLI/environment overrides, optional sanitizer builds, and a `--diag` mode surface runtime state for troubleshooting.
+This document explains **how the whole system runs online**: topology, DNS/Routing, deployments, security posture, performance targets, observability, and day-2 operations. It complements the per-repo READMEs for **Backend (API)** and **Frontend (Next.js)**.
 
 ---
 
-## Architecture at a glance
+## System Overview
 
-- **Bootstrap & configuration (`bootstrap/`, `config/`).** A lightweight DI container wires SFML, storage, networking, and UI services, creating data/cache directories on startup. CLI flags, environment variables, and optional key–value config files feed a shared `Config` instance (precedence: **CLI > ENV > file > defaults**).
-- **Application layer (`app/`).** `Application` owns the render loop, event dispatch, and DI lookups; `SyncOrchestrator` manages backfills, live subscriptions, and snapshot publication; `ChartController` converts user input into viewport updates and backfill requests; `RenderSnapshotBuilder` transforms candle series plus indicator data into draw-ready primitives and UI state.
-- **Domain & core utilities (`domain/`, `core/`).** Domain types describe candles, intervals, repositories, and live stream contracts, while core utilities provide the series cache, viewport math, render snapshot schema, timestamp helpers, and the event bus abstraction.
-- **Infrastructure (`infra/`).**
-  - `exchange/ExchangeGateway` implements `MarketSource` via Boost.Beast REST calls, WebSocket streaming with exponential backoff, idle detection, and jittered reconnects.
-  - `net/WebSocketClient` is a lighter WS client used to stream raw price data into the database engine.
-  - `storage/` bridges binary persistence (`PriceDataManager`) with domain repositories (`PriceDataTimeSeriesRepository`) and real-time cache/observer logic (`DatabaseEngine`).
-  - `tools/CryptoDataFetcher` provides REST historical fetch helpers.
-  - `storage/PriceData` defines the on-disk record layout.
-- **Indicators (`indicators/`).** Pluggable indicator calculators (currently EMA) with caching, version tracking, and optional async recomputation orchestrated through repository snapshots.
-- **User interface (`ui/`).** Rendering is command-queued via `RenderManager`; the chart scene composes grids, cursors, and backgrounds; `MatrixRain` renders animated glyph streams; `ResourceProvider` lazily loads fonts/textures with fallbacks; `Cursor` draws custom crosshairs tied to event bus updates.
+* **Frontend**: Next.js (app router) deployed as a **static site on Cloudflare Pages**. It renders charts (e.g., lightweight-charts) and calls the public API over HTTPS.
+* **Backend (API)**: C++ service exposing **REST + WebSocket** for OHLCV data. Runs on **AWS EC2** (Amazon Linux 2023) in **sa-east-1 (São Paulo)**. Persists data in **DuckDB** on an attached volume. Ingests live candles from Binance WS, and (optionally) backfills via Binance REST.
+* **Edge & DNS**: **Cloudflare** is the public edge (DNS + proxy).
+
+  * `tradingchart.ink` → frontend (Pages)
+  * `api.tradingchart.ink` → backend (EC2, proxied by Cloudflare)
+
+The platform focuses on ingesting, persisting, and serving **historical market data (OHLCV)** while exposing primitives for **technical analysis** (interval selection, symbol metadata, and server-side indicator computation roadmap). The frontend consumes these datasets to render **interactive charts and TA overlays**.
 
 ---
 
-## Repository layout
+## High-Level Topology
 
+```mermaid
+flowchart LR
+    subgraph Client
+      B[Browser]
+    end
+
+    subgraph Cloudflare
+      CF_DNS[DNS & Proxy (WAF, TLS)]
+      CF_Pages[Pages (Static Frontend)]
+    end
+
+    subgraph AWS sa-east-1
+      EC2[EC2: API Container<br/>REST + WebSocket]
+      VOL[(EBS/EFS: /data/market.duckdb)]
+      Binance[(Binance WS/REST)]
+    end
+
+    B -- https://tradingchart.ink --> CF_Pages
+    B -- https://api.tradingchart.ink --> CF_DNS --> EC2
+    EC2 <-- live WS / backfill REST --> Binance
+    EC2 <-- DuckDB file I/O --> VOL
 ```
 
-app/         UI orchestration, sync logic, render snapshot construction
-bootstrap/   DI container, service registration, program entry point
-config/      Configuration structures and loaders
-core/        Event bus, caches, rendering primitives, viewport maths
-domain/      Market abstractions and repository contracts
-infra/       Networking, exchange gateway, storage, tooling backends
-indicators/  Indicator engines and coordinators
-ui/          Rendering commands, scenes, resources, visual components
-data/        Default data directory (runtime-populated)
+---
 
-````
+## Domains & Routing
+
+* **Apex**: `tradingchart.ink`
+  Cloudflare Pages project hosts the static Next.js build.
+
+  * Pages build command: `pnpm run build` (or `next build`)
+  * Output directory: `out/` (via `output: 'export'` in `next.config.js`)
+
+* **API**: `api.tradingchart.ink`
+  Cloudflare DNS **CNAME** (proxied) → the EC2 public IP (or ALB DNS if using a load balancer).
+  SSL/TLS terminates at Cloudflare (orange cloud). Health checks hit `/healthz`.
 
 ---
 
-## Build & dependencies
+## Components
 
-### Ubuntu
+### Frontend (Next.js on Cloudflare Pages)
 
-```sh
-sudo apt update
-sudo apt install -y build-essential g++ make pkg-config \
-  libsfml-dev libssl-dev \
-  libboost-system-dev libboost-json-dev
-````
+* Pure static export (`output: 'export'`) so Pages can serve it from the edge.
+* Calls the API using `https://api.tradingchart.ink`.
+* Avoids a Next.js `/api` layer to keep it static and fast.
 
-### Build targets
+**Build hints**
 
-```sh
-make -j"$(nproc)"                # Debug build with warnings and -g (default)
-make SANITIZE=address -j         # Enable ASAN instrumentation
-make SANITIZE=address,undefined -j
-make MODE=release -j             # Optimized build (-O3 -DNDEBUG) without sanitizers
-make WERROR=1 -j                 # Optional: promote warnings to errors
-make clean                       # Remove obj/bin
-```
+* `next.config.js`:
 
-The binary is emitted at `bin/main`; object files are under `obj/`.
+  ```js
+  /** @type {import('next').NextConfig} */
+  const nextConfig = {
+    output: 'export',
+    eslint: { ignoreDuringBuilds: true },
+    typescript: { ignoreBuildErrors: true },
+    images: { unoptimized: true },
+  };
+  export default nextConfig;
+  ```
+* `package.json` (relevant scripts):
 
----
+  ```json
+  {
+    "scripts": {
+      "build": "next build"
+    }
+  }
+  ```
 
-## Running the application
+### Backend (C++ API on AWS EC2)
 
-```sh
-./bin/main --symbol ETHUSDT --interval 5m --log-level debug
-```
+* **Endpoints**:
 
-**Available CLI options** include symbol/interval selection, data & cache directories, window geometry/fullscreen, REST/WS overrides, log level, and helper flags (`--help`, `--version`, `--diag`).
-
-**Configuration precedence:**
-CLI → ENV (`TTP_SYMBOL`, `TTP_INTERVAL`, `TTP_DATA_DIR`, `TTP_CACHE_DIR`, `TTP_WINDOW_W`, `TTP_WINDOW_H`, `TTP_FULLSCREEN`, `TTP_LOG_LEVEL`, `TTP_REST_HOST`, `TTP_WS_HOST`, `TTP_WS_PATH`) → key=value file passed via `--config`/`TTP_CONFIG` → built-in defaults.
-
----
-
-## Runtime logging
-
-* **Default level:** `info`
-* **CLI flags:**
-
-  * `--log-level=<trace|debug|info|warn|error>`
-  * `--trace` (forces `TRACE`)
-  * `--debug` (forces `DEBUG`)
-* **Environment override:** `TTP_LOG_LEVEL=trace|debug|info|warn|error`
-* **Priority:** CLI level > `--trace/--debug` > `TTP_LOG_LEVEL` > default
-
-**Examples:**
-
-```sh
-./bin/main
-TTP_LOG_LEVEL=debug ./bin/main
-./bin/main --trace
-ASAN_OPTIONS=abort_on_error=1:symbolize=1:detect_leaks=1 ./bin/main --trace
-```
-
-At startup the application prints the effective level and sanitizer configuration.
+  * `GET /api/v1/symbols`
+  * `GET /api/v1/intervals?symbol=...`
+  * `GET /api/v1/candles?symbol=...&interval=...&limit=...`
+  * `GET /healthz`, `GET /stats`, `GET /version`
+  * **WebSocket**: `ws://<host>:<port>/ws` (via Cloudflare proxy → `wss://api.tradingchart.ink/ws`)
+* **Data**: DuckDB file at `/data/market.duckdb`
+* **Live ingestion**: Binance WS (kline 1m); backfill via Binance REST.
+* **CORS**: Configurable via flags/env; Cloudflare adds extra perimeter controls.
 
 ---
 
-## Data flow & storage
+## Environments
 
-* At startup the DI configurator ensures `dataDir` and `cacheDir` exist, then registers shared services for rendering, networking, storage, and UI primitives.
-* Application stores time-series data under `<cacheDir>/<symbol>_<interval>_timeseries.bin`, backed by `PriceDataTimeSeriesRepository` and the on-disk `PriceData` layout.
-* `DatabaseEngine` spawns a warm-up thread that repeatedly fetches historical batches, persists them via `PriceDataManager`, maintains a ring buffer cache, and notifies observers of new candles and price limits. Incoming WebSocket ticks are normalised and either replace the open candle or append a closed record, triggering observer callbacks and optional disk writes.
-* `SyncOrchestrator` merges repository snapshots into the `SeriesCache`, publishes `SeriesUpdated` events, and throttles live updates to balance responsiveness with render cost.
+* **Production**
 
----
+  * Region: **sa-east-1** (low latency to Latin America)
+  * Instance: Amazon Linux 2023, Docker runtime
+  * Security Group: inbound `80/tcp` from Cloudflare only (recommended), or 0.0.0.0/0 during bootstrap; outbound `443/tcp` for Binance.
+  * Cloudflare: DNS proxied, WAF basic rules enabled.
 
-## Rendering & interaction
+* **Staging/Dev**
 
-* `ChartController` converts mouse drags, wheel zoom, and keyboard pans into viewport adjustments, requests snapshot rebuilds, and issues backfill requests when the user scrolls beyond loaded history.
-* `RenderSnapshotBuilder` and `core::RenderSnapshot` describe every drawable element (candles, wicks, axes, labels, crosshair, indicator overlays, UI state), allowing the render manager to schedule layered draw commands.
-* The grid scene composes Matrix Rain backgrounds, UI labels, and cursor sprites supplied by the resource provider, which falls back to system fonts/textures when bundled assets are missing.
-
----
-
-## Indicators
-
-`IndicatorCoordinator` augments candle slices with warm-up data from the repository, caches EMA computations keyed by parameters, and supports both synchronous updates and deferred background recomputes to keep UI refreshes snappy.
+  * Optional separate EC2 or local Docker with CORS set to `*` or LAN origin.
+  * Pages deploy preview branches as needed.
 
 ---
 
-## Networking
+## Deployment — Backend (EC2)
 
-`ExchangeGateway` provides a resilient `MarketSource` implementation—issuing REST paginated klines for backfill and maintaining a TLS WebSocket session that parses Binance-style kline payloads, buffers closed candles, and handles idle timeouts plus jittered exponential reconnects.
-A lighter `infra::net::WebSocketClient` streams raw prices directly into the database engine, sharing similar reconnect logic.
+1. **Build the image** (locally or on the instance)
+
+   ```bash
+   docker build -t tradingchart-api:local .
+   ```
+
+2. **Prepare storage**
+
+   ```bash
+   sudo mkdir -p /var/ttv/data
+   sudo chown 1000:1000 /var/ttv/data
+   sudo chmod u+rwX,g+rwX /var/ttv/data
+   ```
+
+3. **Run**
+
+   ```bash
+   sudo docker run -d --name tradingchart-api \
+     -p 80:8080 \
+     -v /var/ttv/data:/data \
+     tradingchart-api:local \
+     ./bin/api --live=1 --storage duck --duckdb /data/market.duckdb \
+       --exchange binance \
+       --live-symbols "BTCUSDT,ETHUSDT" \
+       --live-intervals "1m" \
+       --log-level info \
+       --http.cors.enable=1 \
+       --http.cors.origin "https://www.tradingchart.ink"
+   ```
+
+4. **Smoke tests (from your laptop)**
+
+   ```bash
+   curl -s https://api.tradingchart.ink/healthz
+   curl -s "https://api.tradingchart.ink/api/v1/symbols"
+   curl -s "https://api.tradingchart.ink/api/v1/candles?symbol=BTCUSDT&interval=1m&limit=5"
+   curl -s "https://api.tradingchart.ink/stats"
+   ```
+
+> **Note**: If the API can’t write to DuckDB, check volume permissions and **run the container as the same UID/GID** that owns `/var/ttv/data` or loosen permissions during bootstrap.
 
 ---
 
-## Logging & observability
+## Deployment — Frontend (Cloudflare Pages)
 
-The logging subsystem supports level parsing, category tagging (`NET/DATA/CACHE/SNAPSHOT/RENDER/UI/DB`), timestamped output, and global level changes. CLI options, environment variables, and `TTP_DEBUG` toggle tracing, while sanitizer flags baked into the build surface runtime instrumentation when needed.
+* **Repo**: connect GitHub.
+* **Build command**: `pnpm run build` (or `next build`)
+* **Output dir**: `out/`
+* **Environment variables (Pages)**:
+
+  * `NEXT_PUBLIC_API_BASE=https://api.tradingchart.ink`
+
+**DNS to Pages**
+
+* Map `tradingchart.ink` (and `www`) to the Pages project in Cloudflare → Custom domain.
 
 ---
 
-## Contributing
+## CORS & WebSocket Origins
 
-Issues and PRs are welcome. This README summarises the major systems so new contributors can orient themselves quickly, build the project, and understand how real-time market data flows from the network to on-screen visualisations.
+* **REST CORS**: controlled by flags/env:
 
-```
-```
+  * `--http.cors.enable=1`
+  * `--http.cors.origin "https://www.tradingchart.ink"` (prod)
+  * For dev you can use `"*"` (without credentials) or a CSV once multi-origin support is added.
+* **WebSocket**: browser WS handshake isn’t governed by HTTP CORS. Validate `Origin` upstream (Cloudflare WAF) and restrict who can reach the EC2 (Security Group and CF IPs).
+
+---
+
+## Security Posture
+
+* **Perimeter**: Cloudflare (TLS, WAF, rate limiting if enabled)
+* **Origin**: EC2 security group restricts inbound ports. Prefer allowing only Cloudflare IP ranges to port **80**.
+* **Transport to Binance**: verify TLS (bundle CA in the image or rely on system CA).
+* **Auth/Rate limiting**: not yet in the API; recommend enabling Cloudflare WAF rules / rate limits. Roadmap includes API keys/JWT if needed.
+* **Data at rest**: DuckDB file on EBS/EFS; enable encrypted volumes.
+
+---
+
+## Performance & Scale
+
+* **Targets**
+
+  * REST latency p95 < 200 ms for `limit <= 600` (typical UI views).
+  * WS: thousands of concurrent clients for final candle frames (small payloads).
+  * Ingestion lag: ideally < 2 intervals (≤2 minutes at 1m).
+
+* **Tuning knobs**
+
+  * `--threads <n>` for HTTP concurrency.
+  * Use **São Paulo (sa-east-1)** region to minimize RTT for LATAM.
+  * Ensure `/data` is on general purpose SSD (gp3) or EFS with appropriate throughput if sharing.
+
+* **Known hotspots**
+
+  * JSON serialization for large `limit` fetches.
+  * DuckDB reads when not cached.
+  * WS backpressure (implementation hardening recommended).
+
+---
+
+## Observability
+
+* **Health**: `GET /healthz` → `{"status":"ok"}` when live ingestion is healthy.
+* **Stats**: `GET /stats` → uptime, reconnect counters, route latencies, `ws_state`, `last_msg_age_ms`.
+* **Logging**: structured logs to stdout/stderr (Docker). Increase with `--log-level debug` during incidents.
+
+**Suggested alerts**
+
+* `ws_state == 0` for > 2m
+* `last_msg_age_ms > 120000` (for 1m interval)
+* Sudden growth in `rest_catchup_candles_total`
+
+---
+
+## Day-2 Operations
+
+* **Rotate / Redeploy**
+
+  ```bash
+  sudo docker pull <image:tag> # if pushing to a registry
+  sudo docker rm -f tradingchart-api
+  sudo docker run ...          # same invocation as above
+  ```
+
+* **Backfill (optional)**
+
+  * Run a one-off backfill container with `--backfill` flags (see backend README), mounting `/data` to persist the result.
+
+* **Vacuum / maintenance**
+
+  * Periodic DuckDB maintenance (VACUUM) if the DB grows due to re-ingestion or schema updates.
+
+* **Cost watch**
+
+  * Cloudflare: check **Analytics → Bandwidth/Requests**, enable **rate limiting** if needed.
+  * AWS: **Billing & Cost Management → Cost Explorer** and **Budgets** alarms. EC2 size can be tuned down if idle.
+
+---
+
+## Local Development
+
+* **API**
+
+  ```bash
+  ./bin/api --live=1 --storage duck --duckdb data/market.duckdb \
+    --exchange binance \
+    --live-symbols "BTCUSDT,ETHUSDT" \
+    --live-intervals "1m" \
+    --http.cors.enable=1 \
+    --http.cors.origin="http://localhost:3000" \
+    --log-level debug
+  ```
+
+* **Frontend**
+
+  ```bash
+  npm run dev
+  # NEXT_PUBLIC_API_BASE=http://localhost:8080
+  ```
+
+---
+
+## Troubleshooting Quick Reference
+
+* **Frontend loads but “no chart data”**
+
+  * `GET /api/v1/candles` returns `data: []` → likely DuckDB write permission or ingestion down.
+  * Check `/stats` → `ws_state`, `last_msg_age_ms`.
+  * On EC2: `docker logs -f tradingchart-api` for DuckDB permission errors.
+
+* **522 from Cloudflare**
+
+  * Origin not reachable: Security Group, container down, or port mismatch.
+  * Test origin directly: `curl -I http://<EC2_PUBLIC_IP>/healthz`.
+
+* **CORS errors in browser**
+
+  * Ensure `--http.cors.enable=1` and `--http.cors.origin` matches the exact frontend origin.
+  * Preflight (OPTIONS) support: if the browser sends preflight and API returns 404, add OPTIONS handling (roadmap item).
+
+---
+
+## Roadmap (Architecture)
+
+* **P0**
+
+  * Enforce WS backpressure; expose metrics for slow client closes.
+  * Add `/readyz` endpoint (warmup vs ready).
+  * TLS verification hardening for upstream providers.
+
+* **P1**
+
+  * API auth/rate limiting at the edge (Cloudflare) + optional API keys/JWT in the API.
+  * Connection pooling / reduced per-request DuckDB open/close for high QPS.
+
+* **P2**
+
+  * Server-side indicator endpoints.
+  * Multi-origin CORS (CSV + preflight OPTIONS) first-class support.
+  * Official Dockerfile & CI to publish images.
+
+---
+
+## Quick URLs
+
+* **Frontend**: `https://tradingchart.ink`
+* **API**: `https://api.tradingchart.ink`
+
+  * Health: `/healthz`
+  * Stats: `/stats`
+  * Symbols: `/api/v1/symbols`
+  * Intervals: `/api/v1/intervals?symbol=BTCUSDT`
+  * Candles: `/api/v1/candles?symbol=BTCUSDT&interval=1m&limit=600`
+  * WebSocket: `wss://api.tradingchart.ink/ws`
+
+---
+
+**Contact/On-Call**
+
+* EC2 access (SSH key), Cloudflare account, and GitHub repos are required for operations.
+* Keep a runbook with the exact `docker run` line used in production, plus the current security group rules and Pages build settings.

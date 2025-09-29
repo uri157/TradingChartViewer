@@ -1,0 +1,7 @@
+services:
+  api:
+    # Persistencia en volumen nombrado
+    volumes:
+      - market_data:/data
+    # Variables de prod (no se commitea)
+    env_file: .env.prod

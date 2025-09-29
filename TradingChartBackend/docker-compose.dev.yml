@@ -1,0 +1,9 @@
+services:
+  api:
+    # Bind mount local para desarrollo
+    volumes:
+      - ./data:/data
+    # Evita problemas de permisos en host Linux
+    user: "${UID:-1000}:${GID:-1000}"
+    # Variables de dev (no se commitea)
+    env_file: .env.dev

@@ -1,0 +1,314 @@
+openapi: 3.1.0
+info:
+  title: TheTradingViewer HTTP API
+  version: 0.1.0
+  description: |
+    Endpoints expuestos por el binario `main_api`. La implementación actual no aplica
+    autenticación ni rate limiting. Valores marcados como TODO requieren confirmación
+    revisando el backend correspondiente.
+servers:
+  - url: http://localhost:8080
+    description: Servidor local por defecto
+  - url: http://{lan_ip}:8080
+    description: Servidor en red local
+    variables:
+      lan_ip:
+        default: 192.168.0.10
+        description: Reemplazar por la IP LAN del host
+paths:
+  /healthz:
+    get:
+      summary: Estado de ingesta y WebSocket
+      description: |
+        Devuelve `status: ok` cuando la ingesta de velas está activa y el WebSocket ha
+        recibido mensajes recientes. Si se detecta atraso (`stale_last_message`) o el
+        WebSocket estuvo caído demasiado tiempo (`ws_down`), responde 500 con detalles.
+        Basado en src/api/Controllers.cpp:205-262.
+      responses:
+        '200':
+          description: Todo en orden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthOk'
+              examples:
+                ok:
+                  value:
+                    status: ok
+        '500':
+          description: Degradado o fuera de servicio
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthError'
+              examples:
+                stale:
+                  value:
+                    status: error
+                    details:
+                      - issue: stale_last_message
+                        last_msg_age_ms: 180000
+                        interval_ms: 60000
+                      - issue: ws_down
+                        duration_seconds: 200
+  /version:
+    get:
+      summary: Información de versión
+      description: Devuelve nombre y versión fija del backend (`ttp-backend` 0.1.0).
+      responses:
+        '200':
+          description: Versión actual
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Version'
+              examples:
+                default:
+                  value:
+                    name: ttp-backend
+                    version: '0.1.0'
+  /api/v1/candles:
+    get:
+      summary: Recupera velas históricas
+      description: |
+        Lee velas desde el repositorio configurado. Requiere símbolo e intervalo. La
+        respuesta siempre ordena por timestamp ascendente. Basado en
+        src/api/Controllers.cpp:300-382 y repositorios Duck/Legacy.
+      parameters:
+        - in: query
+          name: symbol
+          required: true
+          schema:
+            type: string
+          description: Símbolo (alias aceptados: `pair`, `ticker`).
+        - in: query
+          name: interval
+          required: true
+          schema:
+            type: string
+            enum: [1m, 5m, 1h, 1d]
+          description: Intervalo (alias aceptados: `resolution`, `tf`).
+        - in: query
+          name: from
+          schema:
+            type: integer
+            format: int64
+          description: |
+            Timestamp inicial en ms o s (alias: `fromTs`, `start`, `startTime`).
+            TODO: confirmar unidad exacta esperada por cada repositorio (ver src/api/Controllers.cpp:345-358).
+        - in: query
+          name: to
+          schema:
+            type: integer
+            format: int64
+          description: |
+            Timestamp final inclusive en ms o s (alias: `toTs`, `end`, `endTime`).
+            Debe ser >= `from` cuando ambos se proporcionan. TODO: confirmar unidad exacta (ver src/api/Controllers.cpp:360-373).
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 5000
+            default: 200
+          description: |
+            Número máximo de velas a devolver (alias: `max`, `count`). Valores >5000 se recortan.
+      responses:
+        '200':
+          description: Velas encontradas (puede ser arreglo vacío)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CandlesResponse'
+              examples:
+                sample:
+                  value:
+                    symbol: BTCUSDT
+                    interval: 1m
+                    data:
+                      - [1735689600000, 42000.0, 42100.0, 41950.0, 42050.0, 12.34]
+                  summary: TODO: confirmar ejemplo con datos reales (ver src/api/Controllers.cpp:214-243).
+        '400':
+          description: Error de validación de parámetros
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                missingSymbol:
+                  value:
+                    error: symbol is required
+                badInterval:
+                  value:
+                    error: interval must be one of 1m,5m,1h,1d
+        '500':
+          description: Repositorio no configurado (lanza excepción)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          x-notes: Puede ocurrir si no se configuró `ICandleReadRepo` (ver ServiceLocator).
+  /stats:
+    get:
+      summary: Métricas de ejecución
+      description: |
+        Devuelve métricas del `Registry` interno: uptime, hilos, estado del backend y
+        métricas por ruta. Basado en src/api/Controllers.cpp:384-448.
+      responses:
+        '200':
+          description: Snapshot de métricas
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatsResponse'
+              examples:
+                default:
+                  value:
+                    uptime_seconds: 123.45
+                    threads: 4
+                    backend_active: true
+                    reconnect_attempts_total: 0
+                    rest_catchup_candles_total: 0
+                    ws_state: 1
+                    last_msg_age_ms: 1200
+                    routes:
+                      GET /api/v1/candles:
+                        requests: 42
+                        p95_ms: 12.3
+                        p99_ms: 15.6
+        '500':
+          description: Error interno al recolectar métricas
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+components:
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Mensaje legible con la causa del error.
+    HealthOk:
+      type: object
+      properties:
+        status:
+          type: string
+          const: ok
+      required: [status]
+    HealthError:
+      type: object
+      properties:
+        status:
+          type: string
+          const: error
+        details:
+          type: array
+          items:
+            $ref: '#/components/schemas/HealthIssue'
+      required: [status, details]
+    HealthIssue:
+      type: object
+      properties:
+        issue:
+          type: string
+          enum: [stale_last_message, ws_down]
+        last_msg_age_ms:
+          type: number
+          description: Edad del último mensaje (cuando issue=stale_last_message)
+        interval_ms:
+          type: number
+          description: Intervalo esperado entre mensajes (issue=stale_last_message)
+        duration_seconds:
+          type: number
+          description: Duración del downtime del WS (issue=ws_down)
+      required: [issue]
+    Version:
+      type: object
+      required: [name, version]
+      properties:
+        name:
+          type: string
+        version:
+          type: string
+    CandlesResponse:
+      type: object
+      required: [symbol, interval, data]
+      properties:
+        symbol:
+          type: string
+        interval:
+          type: string
+          enum: [1m, 5m, 1h, 1d]
+        data:
+          type: array
+          description: Lista de velas `[ts, open, high, low, close, volume]`.
+          items:
+            $ref: '#/components/schemas/CandleTuple'
+    CandleTuple:
+      type: array
+      description: |
+        `[timestamp_ms, open, high, low, close, volume]`. El servidor normaliza `timestamp_ms`
+        a milisegundos si recibe segundos (ver src/api/Controllers.cpp:29-46). TODO: confirmar si otros backends usan otro formato.
+      minItems: 6
+      maxItems: 6
+      prefixItems:
+        - type: integer
+          format: int64
+        - type: number
+        - type: number
+        - type: number
+        - type: number
+        - type: number
+      items: false
+    StatsResponse:
+      type: object
+      required:
+        - uptime_seconds
+        - threads
+        - backend_active
+        - reconnect_attempts_total
+        - rest_catchup_candles_total
+        - ws_state
+        - last_msg_age_ms
+        - routes
+      properties:
+        uptime_seconds:
+          type: number
+        threads:
+          type: integer
+        backend_active:
+          type: boolean
+        reconnect_attempts_total:
+          type: integer
+          format: int64
+        rest_catchup_candles_total:
+          type: integer
+          format: int64
+        ws_state:
+          type: number
+          description: 1 si el WS está conectado, 0 si se detecta caída.
+        last_msg_age_ms:
+          type: number
+        routes:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/RouteStats'
+    RouteStats:
+      type: object
+      required: [requests]
+      properties:
+        requests:
+          type: integer
+          format: int64
+        p95_ms:
+          type: number
+          nullable: true
+          description: Percentil 95 si hay suficientes muestras.
+        p99_ms:
+          type: number
+          nullable: true
+          description: Percentil 99 si hay suficientes muestras.
