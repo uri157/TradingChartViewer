@@ -1,4 +1,6 @@
-# TradingChart — Architecture & Operations README
+# TradingChart — Architecture & Operations README 
+
+# Live Deployment -> www.tradingchart.ink
 
 > **Goal:** serve **financial price history** and **technical analysis tools** (OHLCV candles, indicators, time-series utilities) to a Next.js web app with low latency and high availability.
 
