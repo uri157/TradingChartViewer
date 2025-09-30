@@ -91,3 +91,9 @@ ehthumbs.db
 Icon?
 
 prompts.txt
+
+
+# env files
+.env
+.env.*
+!.env.example
