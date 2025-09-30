@@ -21,33 +21,6 @@ The platform focuses on ingesting, persisting, and serving **historical market d
 
 ---
 
-## High-Level Topology
-
-```mermaid
-flowchart LR
-    subgraph Client
-      B[Browser]
-    end
-
-    subgraph Cloudflare
-      CF_DNS[DNS & Proxy (WAF, TLS)]
-      CF_Pages[Pages (Static Frontend)]
-    end
-
-    subgraph AWS sa-east-1
-      EC2[EC2: API Container<br/>REST + WebSocket]
-      VOL[(EBS/EFS: /data/market.duckdb)]
-      Binance[(Binance WS/REST)]
-    end
-
-    B -- https://tradingchart.ink --> CF_Pages
-    B -- https://api.tradingchart.ink --> CF_DNS --> EC2
-    EC2 <-- live WS / backfill REST --> Binance
-    EC2 <-- DuckDB file I/O --> VOL
-```
-
----
-
 ## Domains & Routing
 
 * **Apex**: `tradingchart.ink`
