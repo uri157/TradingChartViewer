@@ -19,6 +19,7 @@ import {
   type CandlestickData,
   type IChartApi,
   type ISeriesApi,
+  type ITimeScaleApi,
   type MouseEventParams,
   type LineData,
   type Time,
@@ -29,10 +30,17 @@ import {
 import type { CandleDTO } from "@/lib/api/types"
 import { clamp, intervalToSeconds, resolveCssColor, type Interval } from "@/lib/utils"
 import { useChartStore } from "@/lib/state/use-chart-store"
+import { useEMAValues } from "@/lib/state/use-ema-values"
 import { getEmaColor } from "@/lib/chart/ema"
 import { buildGhostTimes, GHOST_PAD_BARS, toWhitespaceData } from "@/lib/chart/ghost"
+import { BASE_TIME_SCALE_OPTIONS } from "@/lib/chart/sync"
 
 const isDebug = () => process.env.NEXT_PUBLIC_CHART_DEBUG === "1"
+
+function isAtRightEdge(timeScale: ITimeScaleApi) {
+  const position = timeScale.scrollPosition()
+  return position !== null && position > -0.5 && position < 0.5
+}
 
 function arrayEquals(a: number[], b: number[]) {
   if (a.length !== b.length) return false
@@ -151,6 +159,7 @@ interface UseCandleChartOptions {
   interval: Interval
   onCrosshairMove?: (payload: { price: number | null; time: number | null }) => void
   onReady?: (controls: CandleChartControls | null) => void
+  onRequestAutoStick?: (chart: IChartApi) => void
 }
 
 interface ChartInternals {
@@ -165,7 +174,7 @@ interface ChartInternals {
   ghostSeriesRef: MutableRefObject<ISeriesApi<"Line"> | null>
   containerRef: MutableRefObject<HTMLDivElement | null>
   barSpacingRef: MutableRefObject<number | null>
-  followingRef: MutableRefObject<boolean>
+  autoStickRef: MutableRefObject<boolean>
   lastDataLengthRef: MutableRefObject<number>
   lastTimeRef: MutableRefObject<number | null>
   firstTimeRef: MutableRefObject<number | null>
@@ -187,7 +196,7 @@ const MIN_BAR_SPACING = 2
 const MAX_BAR_SPACING = 40
 const DEFAULT_BAR_SPACING = 8
 const ZOOM_RATIO = 1.2
-const KEYBOARD_SCROLL_FRACTION = 0.1
+const INITIAL_VISIBLE_BARS = 30
 
 function mapCandlesToSeries(candles: CandleDTO[]): CandlestickData[] {
   const formatted: CandlestickData[] = []
@@ -302,7 +311,7 @@ function useChartInternals(): ChartInternals & InteractionInternals {
   const ghostSeriesRef = useRef<ISeriesApi<"Line"> | null>(null)
   const containerRef = useRef<HTMLDivElement | null>(null)
   const barSpacingRef = useRef<number | null>(null)
-  const followingRef = useRef(true)
+  const autoStickRef = useRef(true)
   const lastDataLengthRef = useRef(0)
   const lastTimeRef = useRef<number | null>(null)
   const firstTimeRef = useRef<number | null>(null)
@@ -328,7 +337,7 @@ function useChartInternals(): ChartInternals & InteractionInternals {
     formattedTimesRef,
     containerRef,
     barSpacingRef,
-    followingRef,
+    autoStickRef,
     lastDataLengthRef,
     lastTimeRef,
     firstTimeRef,
@@ -349,63 +358,40 @@ function useBarSpacingControls(
   barSpacingRef: MutableRefObject<number | null>,
   onUserPanOrZoom: () => void,
 ) {
-  const applyBarSpacing = useCallback(
-    (nextSpacing: number) => {
-      const chart = chartRef.current
-      if (!chart) return
-
-      const newSpacing = clamp(nextSpacing, MIN_BAR_SPACING, MAX_BAR_SPACING)
-      if (barSpacingRef.current !== null && newSpacing === barSpacingRef.current) return
-
-      barSpacingRef.current = newSpacing
-      chart.applyOptions({
-        timeScale: { barSpacing: newSpacing },
-      })
-    },
-    [barSpacingRef, chartRef],
-  )
-
   const zoomIn = useCallback(() => {
     onUserPanOrZoom()
     const currentSpacing = barSpacingRef.current ?? DEFAULT_BAR_SPACING
-    applyBarSpacing(currentSpacing * ZOOM_RATIO)
-  }, [applyBarSpacing, barSpacingRef, onUserPanOrZoom])
+    const nextSpacing = clamp(currentSpacing * ZOOM_RATIO, MIN_BAR_SPACING, MAX_BAR_SPACING)
+    barSpacingRef.current = nextSpacing
+    useChartStore.getState().zoomIn()
+  }, [barSpacingRef, onUserPanOrZoom])
 
   const zoomOut = useCallback(() => {
     onUserPanOrZoom()
     const currentSpacing = barSpacingRef.current ?? DEFAULT_BAR_SPACING
-    applyBarSpacing(currentSpacing / ZOOM_RATIO)
-  }, [applyBarSpacing, barSpacingRef, onUserPanOrZoom])
+    const nextSpacing = clamp(currentSpacing / ZOOM_RATIO, MIN_BAR_SPACING, MAX_BAR_SPACING)
+    barSpacingRef.current = nextSpacing
+    useChartStore.getState().zoomOut()
+  }, [barSpacingRef, onUserPanOrZoom])
 
-  return { applyBarSpacing, zoomIn, zoomOut }
+  return { zoomIn, zoomOut }
 }
 
-function useGoLive(chartRef: MutableRefObject<IChartApi | null>, followingRef: MutableRefObject<boolean>) {
+function useGoLive(
+  chartRef: MutableRefObject<IChartApi | null>,
+  autoStickRef: MutableRefObject<boolean>,
+  onRequestAutoStick?: (chart: IChartApi) => void,
+) {
   return useCallback(() => {
-    followingRef.current = true
-    chartRef.current?.timeScale().scrollToRealTime()
-  }, [chartRef, followingRef])
-}
-
-function useScrollByFraction(chartRef: MutableRefObject<IChartApi | null>, onUserPanOrZoom: () => void) {
-  return useCallback(
-    (fraction: number) => {
-      const chart = chartRef.current
-      if (!chart) return
-
-      const timeScale = chart.timeScale()
-      const range = timeScale.getVisibleLogicalRange()
-      if (!range) return
-
-      const delta = (range.to - range.from) * fraction
-      onUserPanOrZoom()
-      timeScale.setVisibleLogicalRange({
-        from: range.from + delta,
-        to: range.to + delta,
-      })
-    },
-    [chartRef, onUserPanOrZoom],
-  )
+    autoStickRef.current = true
+    const chart = chartRef.current
+    if (!chart) return
+    if (onRequestAutoStick) {
+      onRequestAutoStick(chart)
+    } else {
+      chart.timeScale().scrollToRealTime()
+    }
+  }, [autoStickRef, chartRef, onRequestAutoStick])
 }
 
 function useChartInitialization(
@@ -415,6 +401,8 @@ function useChartInitialization(
   onReady: UseCandleChartOptions["onReady"],
   setChartReady: Dispatch<SetStateAction<boolean>>,
   controls: { zoomIn: () => void; zoomOut: () => void; goLive: () => void },
+  registerChart: (chart: IChartApi | null) => void,
+  onRequestAutoStick?: (chart: IChartApi) => void,
 ) {
   const {
     chartRef,
@@ -428,7 +416,7 @@ function useChartInitialization(
     formattedTimesRef,
     containerRef,
     barSpacingRef,
-    followingRef,
+    autoStickRef,
     lastTimeRef,
     firstTimeRef,
     lastDataLengthRef,
@@ -440,6 +428,9 @@ function useChartInitialization(
     intervalRef,
     draftOpenByTimeRef,
   } = internals
+
+  const setEMAValue = useEMAValues((state) => state.setEMAValue)
+  const resetEMAValues = useEMAValues((state) => state.resetEMAValues)
 
   const onCrosshairMoveRef = useRef(onCrosshairMove)
   useEffect(() => {
@@ -460,8 +451,8 @@ function useChartInitialization(
     const container = containerRef.current
     if (!container) return
 
-    const textColor = resolveCssColor("hsl(var(--foreground))")
-    const borderColor = resolveCssColor("hsl(var(--border))")
+    const axisTextColor = resolveCssColor("var(--chart-axis-text)")
+    const gridLineColor = resolveCssColor("var(--chart-grid-line)")
     const accentColor = resolveCssColor("hsl(var(--accent))")
 
     let crosshairHandler: ((param: MouseEventParams<Time>) => void) | null = null
@@ -489,19 +480,19 @@ function useChartInitialization(
           height,
           layout: {
             background: { type: ColorType.Solid, color: "transparent" },
-            textColor,
+            textColor: axisTextColor,
             fontSize: 12,
             fontFamily: "var(--font-geist-sans)",
             attributionLogo: false,
           },
           grid: {
             vertLines: {
-              color: borderColor,
+              color: gridLineColor,
               style: LineStyle.Solid,
               visible: true,
             },
             horzLines: {
-              color: borderColor,
+              color: gridLineColor,
               style: LineStyle.Solid,
               visible: true,
             },
@@ -520,24 +511,36 @@ function useChartInitialization(
             },
           },
           rightPriceScale: {
-            borderColor,
-            textColor,
+            borderColor: gridLineColor,
+            textColor: axisTextColor,
             scaleMargins: {
               top: 0.1,
               bottom: 0.1,
             },
           },
           timeScale: {
-            borderColor,
+            ...BASE_TIME_SCALE_OPTIONS,
+            borderColor: gridLineColor,
             visible: true,
             borderVisible: true,
             fixLeftEdge: false,
-            fixRightEdge: false,
             timeVisible: true,
             secondsVisible: false,
           },
-          handleScroll: false,
-          handleScale: false,
+          handleScroll: {
+            mouseWheel: true,
+            pressedMouseMove: true,
+            horzTouchDrag: true,
+            vertTouchDrag: true,
+          },
+          handleScale: {
+            mouseWheel: true,
+            pinch: true,
+            axisPressedMouseMove: {
+              time: true,
+              price: true,
+            },
+          },
         })
 
         const candlestickSeries = chart.addSeries(CandlestickSeries, {
@@ -547,6 +550,14 @@ function useChartInitialization(
           borderDownColor: "rgba(239,68,68,1)",
           wickUpColor: "rgba(34,197,94,1)",
           wickDownColor: "rgba(239,68,68,1)",
+        })
+
+        candlestickSeries.priceScale().applyOptions({
+          autoScale: false,
+          scaleMargins: {
+            top: 0.15,
+            bottom: 0.2,
+          },
         })
 
         const ghostSeries = chart.addSeries(LineSeries, {
@@ -561,19 +572,35 @@ function useChartInitialization(
         chartRef.current = chart
         seriesRef.current = candlestickSeries
         ghostSeriesRef.current = ghostSeries
+        registerChart(chart)
         sizeReadyRef.current = true
         fitDoneRef.current = false
-        followingRef.current = true
+        autoStickRef.current = true
 
         const existingBarSpacing =
           chart.timeScale().options().barSpacing ?? barSpacingRef.current ?? DEFAULT_BAR_SPACING
         const clampedInitialBarSpacing = clamp(existingBarSpacing, MIN_BAR_SPACING, MAX_BAR_SPACING)
         barSpacingRef.current = clampedInitialBarSpacing
-        chart.applyOptions({ timeScale: { barSpacing: clampedInitialBarSpacing } })
 
         chart.applyOptions({
-          handleScroll: false,
-          handleScale: { axisPressedMouseMove: false, mouseWheel: true, pinch: true },
+          timeScale: {
+            ...BASE_TIME_SCALE_OPTIONS,
+            barSpacing: clampedInitialBarSpacing,
+          },
+          handleScroll: {
+            mouseWheel: true,
+            pressedMouseMove: true,
+            horzTouchDrag: true,
+            vertTouchDrag: true,
+          },
+          handleScale: {
+            mouseWheel: true,
+            pinch: true,
+            axisPressedMouseMove: {
+              time: true,
+              price: true,
+            },
+          },
         })
 
         const handleCrosshairMove = (param: MouseEventParams<Time>) => {
@@ -711,13 +738,19 @@ function useChartInitialization(
             emaSeries.update({ time: time as Time, value })
             emaPreviousValueRef.current.set(period, prevValue)
             emaLastValueRef.current.set(period, value)
+            setEMAValue(period, value)
             if (isDebug()) {
               console.log("[ema] update", period, { action: "append" })
             }
           })
 
-          if (followingRef.current) {
-            chartInstance.timeScale().scrollToRealTime()
+          const timeScale = chartInstance.timeScale()
+          if (autoStickRef.current && isAtRightEdge(timeScale)) {
+            if (onRequestAutoStick) {
+              onRequestAutoStick(chartInstance)
+            } else {
+              timeScale.scrollToRealTime()
+            }
           }
 
           updateGhostSeriesData()
@@ -788,13 +821,19 @@ function useChartInitialization(
             if (!Number.isFinite(value)) return
             emaSeries.update({ time: time as Time, value })
             emaLastValueRef.current.set(period, value)
+            setEMAValue(period, value)
             if (isDebug()) {
               console.log("[ema] update", period, { action: "replace" })
             }
           })
 
-          if (followingRef.current) {
-            chartInstance.timeScale().scrollToRealTime()
+          const timeScale = chartInstance.timeScale()
+          if (autoStickRef.current && isAtRightEdge(timeScale)) {
+            if (onRequestAutoStick) {
+              onRequestAutoStick(chartInstance)
+            } else {
+              timeScale.scrollToRealTime()
+            }
           }
 
           updateGhostSeriesData()
@@ -914,10 +953,13 @@ function useChartInitialization(
       firstTimeRef.current = null
       lastTimeRef.current = null
       lastDataLengthRef.current = 0
-      followingRef.current = true
+      autoStickRef.current = true
       interactions.isDraggingRef.current = false
       interactions.dragStartLogicalRef.current = null
 
+      resetEMAValues()
+
+      registerChart(null)
       setChartReady(false)
     }
   }, [
@@ -930,7 +972,7 @@ function useChartInitialization(
     emaPreviousValueRef,
     emaSeriesMapRef,
     fitDoneRef,
-    followingRef,
+    autoStickRef,
     formattedClosesRef,
     formattedTimesRef,
     interactions.dragStartLogicalRef,
@@ -939,26 +981,25 @@ function useChartInitialization(
     lastTimeRef,
     firstTimeRef,
     setChartReady,
+    registerChart,
     sizeReadyRef,
+    resetEMAValues,
+    setEMAValue,
   ])
 }
 
 function useChartInteractions(
   internals: ChartInternals,
-  interactions: InteractionInternals,
   isChartReady: boolean,
   controls: {
-    applyBarSpacing: (spacing: number) => void
     onUserPanOrZoom: () => void
-    scrollByFraction: (fraction: number) => void
     zoomIn: () => void
     zoomOut: () => void
     goLive: () => void
   },
 ) {
-  const { containerRef, chartRef, barSpacingRef } = internals
-  const { isDraggingRef, dragStartLogicalRef } = interactions
-  const { applyBarSpacing, onUserPanOrZoom, scrollByFraction, zoomIn, zoomOut, goLive } = controls
+  const { containerRef, chartRef } = internals
+  const { onUserPanOrZoom, zoomIn, zoomOut, goLive } = controls
 
   useEffect(() => {
     if (!isChartReady) return
@@ -967,109 +1008,14 @@ function useChartInteractions(
     const chart = chartRef.current
     if (!container || !chart) return
 
-    const timeScale = chart.timeScale()
-
-    const handleWheel = (event: WheelEvent) => {
-      if (event.ctrlKey || event.metaKey) {
-        event.preventDefault()
-        const direction = event.deltaY < 0 ? 1 : -1
-        const multiplier = direction > 0 ? ZOOM_RATIO : 1 / ZOOM_RATIO
-        onUserPanOrZoom()
-        const currentSpacing = barSpacingRef.current ?? DEFAULT_BAR_SPACING
-        applyBarSpacing(currentSpacing * multiplier)
-        return
-      }
-
-      const dominantDelta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY
-      if (dominantDelta === 0) return
-
-      event.preventDefault()
-
-      const range = timeScale.getVisibleLogicalRange()
-      if (!range) return
-
-      const spacing = barSpacingRef.current ?? DEFAULT_BAR_SPACING
-      onUserPanOrZoom()
-      const logicalShift = dominantDelta / spacing
-      timeScale.setVisibleLogicalRange({
-        from: range.from + logicalShift,
-        to: range.to + logicalShift,
-      })
-    }
-
-    let panActive = false
-    let startRange: LogicalRange | null = null
-    let startLogicalAtPointer: number | null = null
-    let panRaf = 0
-
-    const relativeX = (event: PointerEvent) => {
-      const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
-      return event.clientX - rect.left
-    }
-
-    const onPointerDown = (event: PointerEvent) => {
-      if (event.button !== 0) return
-
-      const start = relativeX(event)
-      const visibleRange = timeScale.getVisibleLogicalRange() ?? null
-      const logicalAtPointer = timeScale.coordinateToLogical(start) as number | null
-      if (!visibleRange || logicalAtPointer == null) {
-        return
-      }
-
-      panActive = true
-      startRange = visibleRange
-      startLogicalAtPointer = logicalAtPointer
-      isDraggingRef.current = true
-      dragStartLogicalRef.current = logicalAtPointer
-      onUserPanOrZoom()
-      container.setPointerCapture?.(event.pointerId)
-    }
-
-    const onPointerMove = (event: PointerEvent) => {
-      if (!panActive || !startRange || startLogicalAtPointer == null) {
-        return
-      }
-
-      if (panRaf) return
-      const x = relativeX(event)
-      panRaf = requestAnimationFrame(() => {
-        panRaf = 0
-        const logicalNow = timeScale.coordinateToLogical(x) as number | null
-        if (logicalNow == null || !startRange) return
-
-        const deltaBars = logicalNow - startLogicalAtPointer!
-        let from = startRange.from - deltaBars
-        let to = startRange.to - deltaBars
-
-        timeScale.setVisibleLogicalRange({ from, to })
-        dragStartLogicalRef.current = logicalNow
-      })
-    }
-
-    const endPan = (event: PointerEvent) => {
-      if (!panActive) return
-      panActive = false
-      startRange = null
-      startLogicalAtPointer = null
-      isDraggingRef.current = false
-      dragStartLogicalRef.current = null
-      if (panRaf) {
-        cancelAnimationFrame(panRaf)
-        panRaf = 0
-      }
-      try {
-        container.releasePointerCapture?.(event.pointerId)
-      } catch (error) {
-        if (isDebug()) {
-          console.warn("[chart] releasePointerCapture failed", error)
-        }
-      }
-    }
-
     const handleKeyDown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null
-      if (target && ["INPUT", "TEXTAREA"].includes(target.tagName)) return
+      if (
+        target &&
+        (["INPUT", "TEXTAREA"].includes(target.tagName) || target.isContentEditable || event.metaKey || event.ctrlKey)
+      ) {
+        return
+      }
 
       switch (event.key) {
         case "+":
@@ -1082,14 +1028,6 @@ function useChartInteractions(
           event.preventDefault()
           zoomOut()
           break
-        case "ArrowLeft":
-          event.preventDefault()
-          scrollByFraction(-KEYBOARD_SCROLL_FRACTION)
-          break
-        case "ArrowRight":
-          event.preventDefault()
-          scrollByFraction(KEYBOARD_SCROLL_FRACTION)
-          break
         case "Home":
           event.preventDefault()
           goLive()
@@ -1097,41 +1035,26 @@ function useChartInteractions(
       }
     }
 
-    container.addEventListener("wheel", handleWheel, { passive: false })
-    container.addEventListener("pointerdown", onPointerDown)
-    container.addEventListener("pointermove", onPointerMove)
-    container.addEventListener("pointerup", endPan)
-    container.addEventListener("pointerleave", endPan)
-    container.addEventListener("pointercancel", endPan)
+    const markInteraction = () => {
+      onUserPanOrZoom()
+    }
+
+    const markInteractionPassive = () => {
+      onUserPanOrZoom()
+    }
+
+    container.addEventListener("mousedown", markInteraction)
+    container.addEventListener("wheel", markInteractionPassive, { passive: true })
+    container.addEventListener("touchstart", markInteractionPassive, { passive: true })
     window.addEventListener("keydown", handleKeyDown)
 
     return () => {
-      container.removeEventListener("wheel", handleWheel)
-      container.removeEventListener("pointerdown", onPointerDown)
-      container.removeEventListener("pointermove", onPointerMove)
-      container.removeEventListener("pointerup", endPan)
-      container.removeEventListener("pointerleave", endPan)
-      container.removeEventListener("pointercancel", endPan)
+      container.removeEventListener("mousedown", markInteraction)
+      container.removeEventListener("wheel", markInteractionPassive)
+      container.removeEventListener("touchstart", markInteractionPassive)
       window.removeEventListener("keydown", handleKeyDown)
-      if (panRaf) {
-        cancelAnimationFrame(panRaf)
-        panRaf = 0
-      }
     }
-  }, [
-    applyBarSpacing,
-    barSpacingRef,
-    chartRef,
-    containerRef,
-    dragStartLogicalRef,
-    goLive,
-    isChartReady,
-    isDraggingRef,
-    onUserPanOrZoom,
-    scrollByFraction,
-    zoomIn,
-    zoomOut,
-  ])
+  }, [chartRef, containerRef, goLive, isChartReady, onUserPanOrZoom, zoomIn, zoomOut])
 }
 
 function useSeriesData(
@@ -1141,11 +1064,12 @@ function useSeriesData(
   isChartReady: boolean,
   setIsLoading: Dispatch<SetStateAction<boolean>>,
   emaPeriods: number[],
+  onRequestAutoStick?: (chart: IChartApi) => void,
 ) {
   const {
     chartRef,
     seriesRef,
-    followingRef,
+    autoStickRef,
     lastDataLengthRef,
     lastTimeRef,
     firstTimeRef,
@@ -1165,6 +1089,9 @@ function useSeriesData(
     intervalRef,
     draftOpenByTimeRef,
   } = internals
+
+  const setEMAValue = useEMAValues((state) => state.setEMAValue)
+  const resetEMAValues = useEMAValues((state) => state.resetEMAValues)
 
   useEffect(() => {
     const chart = chartRef.current
@@ -1208,6 +1135,9 @@ function useSeriesData(
           color: getEmaColor(period),
           lineWidth: 2,
           priceScaleId: "right",
+          lastValueVisible: false,
+          priceLineVisible: false,
+          crosshairMarkerVisible: false,
         })
         emaSeriesMapRef.current.set(period, emaSeries)
         logEma("add", period)
@@ -1230,6 +1160,7 @@ function useSeriesData(
       emaSeriesMapRef.current.delete(period)
       emaLastValueRef.current.delete(period)
       emaPreviousValueRef.current.delete(period)
+      setEMAValue(period, undefined)
     }
 
     const clearEmaData = (period: number) => {
@@ -1240,6 +1171,7 @@ function useSeriesData(
       }
       emaLastValueRef.current.delete(period)
       emaPreviousValueRef.current.delete(period)
+      setEMAValue(period, undefined)
     }
 
     const desiredSet = new Set(desiredPeriods)
@@ -1266,6 +1198,7 @@ function useSeriesData(
       lastTimeRef.current = null
       lastDataLengthRef.current = 0
       fitDoneRef.current = false
+      autoStickRef.current = true
       draftOpenByTimeRef.current.clear()
       closeByTimeRef.current.clear()
       candlestickBufferRef.current = []
@@ -1273,6 +1206,7 @@ function useSeriesData(
       if (ghostSeries) {
         ghostSeries.setData([])
       }
+      resetEMAValues()
       setIsLoading(false)
       return
     }
@@ -1290,8 +1224,10 @@ function useSeriesData(
       lastTimeRef.current = null
       lastDataLengthRef.current = 0
       fitDoneRef.current = false
+      autoStickRef.current = true
       candlestickBufferRef.current = []
       ghostBufferRef.current = []
+      resetEMAValues()
       setIsLoading(true)
       return
     }
@@ -1351,6 +1287,26 @@ function useSeriesData(
 
     if (datasetChanged) {
       fitDoneRef.current = false
+      autoStickRef.current = true
+      resetEMAValues()
+    }
+
+    const applyInitialVisibleRange = () => {
+      if (!autoStickRef.current) {
+        return
+      }
+
+      const totalBars = formattedData.length
+      if (totalBars === 0) return
+
+      const toIndex = totalBars - 1
+      const fromIndex = Math.max(0, toIndex - (INITIAL_VISIBLE_BARS - 1))
+      const logicalRange: LogicalRange = {
+        from: fromIndex - 0.25,
+        to: toIndex + 0.75,
+      }
+
+      timeScale.setVisibleLogicalRange(logicalRange)
     }
 
     const shouldResetSeries = lastDataLengthRef.current === 0 || datasetChanged
@@ -1368,8 +1324,10 @@ function useSeriesData(
         emaSeries.setData(points)
         if (points.length && lastValue != null) {
           emaLastValueRef.current.set(period, lastValue)
+          setEMAValue(period, lastValue)
         } else {
           emaLastValueRef.current.delete(period)
+          setEMAValue(period, undefined)
         }
         if (points.length && previousValue != null) {
           emaPreviousValueRef.current.set(period, previousValue)
@@ -1398,6 +1356,7 @@ function useSeriesData(
         }
       }
 
+      resetEMAValues()
       series.setData(formattedData)
 
       if (typeof currentBarSpacing === "number") {
@@ -1405,10 +1364,19 @@ function useSeriesData(
       }
 
       if (shouldFitAfterSet) {
-        chart.timeScale().fitContent()
+        let appliedInitialRange = false
+        if (autoStickRef.current) {
+          applyInitialVisibleRange()
+          appliedInitialRange = true
+        } else {
+          chart.timeScale().fitContent()
+        }
         fitDoneRef.current = true
         if (debug) {
-          console.log("[chart] setData + fitContent", { len: formattedData.length })
+          console.log(
+            `[chart] setData + ${appliedInitialRange ? "initialRange" : "fitContent"}`,
+            { len: formattedData.length },
+          )
         }
       } else if (debug) {
         console.log("[chart] setData (no fit)", { len: formattedData.length })
@@ -1486,6 +1454,7 @@ function useSeriesData(
         if (!Number.isFinite(value)) return
         emaSeries.update({ time: latestTime as Time, value })
         emaLastValueRef.current.set(period, value)
+        setEMAValue(period, value)
         logEma("update", period, { action })
       })
     } else {
@@ -1500,6 +1469,7 @@ function useSeriesData(
         emaSeries.update({ time: latestTime as Time, value })
         emaPreviousValueRef.current.set(period, prevValue)
         emaLastValueRef.current.set(period, value)
+        setEMAValue(period, value)
         logEma("update", period, { action })
       })
     }
@@ -1510,8 +1480,12 @@ function useSeriesData(
       firstTimeRef.current = firstTime
     }
 
-    if (followingRef.current) {
-      timeScale.scrollToRealTime()
+    if (autoStickRef.current && isAtRightEdge(timeScale)) {
+      if (onRequestAutoStick && chart) {
+        onRequestAutoStick(chart)
+      } else {
+        timeScale.scrollToRealTime()
+      }
     }
 
     setIsLoading(false)
@@ -1526,10 +1500,11 @@ function useSeriesData(
     emaPreviousValueRef,
     emaSeriesMapRef,
     fitDoneRef,
-    followingRef,
+    autoStickRef,
     firstTimeRef,
     formattedClosesRef,
     formattedTimesRef,
+    onRequestAutoStick,
     interval,
     isChartReady,
     lastDataLengthRef,
@@ -1537,17 +1512,22 @@ function useSeriesData(
     seriesRef,
     setIsLoading,
     sizeReadyRef,
+    resetEMAValues,
+    setEMAValue,
   ])
 }
 
 export function useCandleChart(options: UseCandleChartOptions) {
-  const { data, interval, onCrosshairMove, onReady } = options
+  const { data, interval, onCrosshairMove, onReady, onRequestAutoStick } = options
   const [isLoading, setIsLoading] = useState(true)
   const [isChartReady, setIsChartReady] = useState(false)
   const emaPeriods = useChartStore((state) => state.emaPeriods)
+  const symbol = useChartStore((state) => state.symbol)
+  const setChart = useChartStore((state) => state.setChart)
+  const resetEMAValues = useEMAValues((state) => state.resetEMAValues)
 
   const internals = useChartInternals()
-  const { chartRef, barSpacingRef, followingRef } = internals
+  const { chartRef, barSpacingRef, autoStickRef } = internals
 
   const interactions = useMemo(() => {
     return {
@@ -1557,29 +1537,43 @@ export function useCandleChart(options: UseCandleChartOptions) {
   }, [internals.dragStartLogicalRef, internals.isDraggingRef])
 
   const onUserPanOrZoom = useCallback(() => {
-    followingRef.current = false
-  }, [followingRef])
+    autoStickRef.current = false
+  }, [autoStickRef])
 
-  const { applyBarSpacing, zoomIn, zoomOut } = useBarSpacingControls(chartRef, barSpacingRef, onUserPanOrZoom)
-  const goLive = useGoLive(chartRef, followingRef)
-  const scrollByFraction = useScrollByFraction(chartRef, onUserPanOrZoom)
+  const { zoomIn, zoomOut } = useBarSpacingControls(chartRef, barSpacingRef, onUserPanOrZoom)
+  const goLive = useGoLive(chartRef, autoStickRef, onRequestAutoStick)
 
-  useChartInitialization(internals, interactions, onCrosshairMove, onReady, setIsChartReady, {
-    zoomIn,
-    zoomOut,
-    goLive,
-  })
+  useEffect(() => {
+    resetEMAValues()
+  }, [interval, symbol, resetEMAValues])
 
-  useChartInteractions(internals, interactions, isChartReady, {
-    applyBarSpacing,
+  useEffect(() => {
+    autoStickRef.current = true
+  }, [autoStickRef, interval, symbol])
+
+  useChartInitialization(
+    internals,
+    interactions,
+    onCrosshairMove,
+    onReady,
+    setIsChartReady,
+    {
+      zoomIn,
+      zoomOut,
+      goLive,
+    },
+    setChart,
+    onRequestAutoStick,
+  )
+
+  useChartInteractions(internals, isChartReady, {
     onUserPanOrZoom,
-    scrollByFraction,
     zoomIn,
     zoomOut,
     goLive,
   })
 
-  useSeriesData(internals, data, interval, isChartReady, setIsLoading, emaPeriods)
+  useSeriesData(internals, data, interval, isChartReady, setIsLoading, emaPeriods, onRequestAutoStick)
 
   return {
     containerRef: internals.containerRef,

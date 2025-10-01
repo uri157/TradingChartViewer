@@ -2,6 +2,7 @@
 
 import { create } from "zustand"
 import { persist } from "zustand/middleware"
+import type { IChartApi } from "lightweight-charts"
 
 import type { Symbol, Interval } from "@/lib/api/types"
 
@@ -26,6 +27,10 @@ interface ChartState {
   }
   emaPeriods: number[]
   indicators: ChartIndicatorsState
+  chart?: IChartApi | null
+  setChart: (chart: IChartApi | null) => void
+  zoomIn: () => void
+  zoomOut: () => void
   setSymbol: (symbol: Symbol) => void
   setInterval: (interval: Interval) => void
   setRange: (range: { from?: number; to?: number }) => void
@@ -48,99 +53,129 @@ const DEFAULT_MACD_STATE: MACDIndicatorState = {
 
 export const useChartStore = create<ChartState>()(
   persist(
-    (set, get) => ({
-      symbol: "BTCUSDT",
-      interval: "1m",
-      range: {},
-      emaPeriods: [9, 21],
-      indicators: { macd: { ...DEFAULT_MACD_STATE } },
-      setSymbol: (symbol) => set({ symbol }),
-      setInterval: (interval) => set({ interval }),
-      setRange: (range) => set({ range }),
-      addEma: (period) =>
-        set((state) => {
-          const normalized = Math.trunc(period)
-          if (!Number.isFinite(normalized) || normalized <= 0) {
-            return state
-          }
-          if (state.emaPeriods.includes(normalized)) {
-            return state
-          }
-          const next = [...state.emaPeriods, normalized].sort((a, b) => a - b)
-          return { emaPeriods: next }
-        }),
-      removeEma: (period) =>
-        set((state) => ({
-          emaPeriods: state.emaPeriods.filter((value) => value !== period),
-        })),
-      showMACD: () =>
-        set((state) => ({
-          indicators: {
-            ...state.indicators,
-            macd: { ...state.indicators.macd, visible: true },
-          },
-        })),
-      hideMACD: () =>
-        set((state) => ({
-          indicators: {
-            ...state.indicators,
-            macd: { ...state.indicators.macd, visible: false },
-          },
-        })),
-      toggleMACD: () => {
-        const {
-          indicators: { macd },
-        } = get()
-        set((state) => ({
-          indicators: {
-            ...state.indicators,
-            macd: { ...macd, visible: !macd.visible },
-          },
-        }))
-      },
-      setMACDParams: (params) =>
-        set((state) => {
-          const requestedFast =
-            params.fast !== undefined && Number.isFinite(params.fast) && params.fast > 0
-              ? Math.trunc(params.fast)
-              : state.indicators.macd.fast
-          const requestedSlow =
-            params.slow !== undefined && Number.isFinite(params.slow) && params.slow > 0
-              ? Math.trunc(params.slow)
-              : state.indicators.macd.slow
-          const requestedSignal =
-            params.signal !== undefined && Number.isFinite(params.signal) && params.signal > 0
-              ? Math.trunc(params.signal)
-              : state.indicators.macd.signal
+    (set, get) => {
+      const zoom = (factor: number) => {
+        const chartInstance = get().chart
+        if (!chartInstance) return
 
-          const fast = Math.max(1, requestedFast)
-          const slow = Math.max(fast + 1, requestedSlow)
-          const signal = Math.max(1, requestedSignal)
-          return {
+        const timeScale = chartInstance.timeScale()
+        const range = timeScale.getVisibleLogicalRange()
+        if (!range) return
+
+        const toValue = typeof range.to === "number" ? range.to : Number(range.to)
+        if (!Number.isFinite(range.from) || !Number.isFinite(toValue)) return
+
+        const center = (range.from + toValue) / 2
+        const half = (toValue - range.from) / 2
+        if (!Number.isFinite(half) || half <= 0) return
+
+        const newHalf = half / factor
+        if (!Number.isFinite(newHalf) || newHalf <= 0) return
+
+        timeScale.setVisibleLogicalRange({ from: center - newHalf, to: center + newHalf })
+      }
+
+      return {
+        symbol: "BTCUSDT",
+        interval: "1m",
+        range: {},
+        emaPeriods: [9, 21],
+        indicators: { macd: { ...DEFAULT_MACD_STATE } },
+        chart: null,
+        setChart: (chart) => set({ chart }),
+        zoomIn: () => zoom(1.25),
+        zoomOut: () => zoom(1 / 1.25),
+        setSymbol: (symbol) => set({ symbol }),
+        setInterval: (interval) => set({ interval }),
+        setRange: (range) => set({ range }),
+        addEma: (period) =>
+          set((state) => {
+            const normalized = Math.trunc(period)
+            if (!Number.isFinite(normalized) || normalized <= 0) {
+              return state
+            }
+            if (state.emaPeriods.includes(normalized)) {
+              return state
+            }
+            const next = [...state.emaPeriods, normalized].sort((a, b) => a - b)
+            return { emaPeriods: next }
+          }),
+        removeEma: (period) =>
+          set((state) => ({
+            emaPeriods: state.emaPeriods.filter((value) => value !== period),
+          })),
+        showMACD: () =>
+          set((state) => ({
             indicators: {
               ...state.indicators,
-              macd: {
-                ...state.indicators.macd,
-                fast,
-                slow,
-                signal,
+              macd: { ...state.indicators.macd, visible: true },
+            },
+          })),
+        hideMACD: () =>
+          set((state) => ({
+            indicators: {
+              ...state.indicators,
+              macd: { ...state.indicators.macd, visible: false },
+            },
+          })),
+        toggleMACD: () => {
+          const {
+            indicators: { macd },
+          } = get()
+          set((state) => ({
+            indicators: {
+              ...state.indicators,
+              macd: { ...macd, visible: !macd.visible },
+            },
+          }))
+        },
+        setMACDParams: (params) =>
+          set((state) => {
+            const requestedFast =
+              params.fast !== undefined && Number.isFinite(params.fast) && params.fast > 0
+                ? Math.trunc(params.fast)
+                : state.indicators.macd.fast
+            const requestedSlow =
+              params.slow !== undefined && Number.isFinite(params.slow) && params.slow > 0
+                ? Math.trunc(params.slow)
+                : state.indicators.macd.slow
+            const requestedSignal =
+              params.signal !== undefined && Number.isFinite(params.signal) && params.signal > 0
+                ? Math.trunc(params.signal)
+                : state.indicators.macd.signal
+
+            const fast = Math.max(1, requestedFast)
+            const slow = Math.max(fast + 1, requestedSlow)
+            const signal = Math.max(1, requestedSignal)
+            return {
+              indicators: {
+                ...state.indicators,
+                macd: {
+                  ...state.indicators.macd,
+                  fast,
+                  slow,
+                  signal,
+                },
               },
-            },
-          }
-        }),
-      setMACDHeight: (height) =>
-        set((state) => {
-          const minHeight = 120
-          const maxHeight = Math.max(minHeight, Math.floor((typeof window !== "undefined" ? window.innerHeight : 600) * 0.5))
-          const nextHeight = Math.min(Math.max(Math.floor(height), minHeight), maxHeight)
-          return {
-            indicators: {
-              ...state.indicators,
-              macd: { ...state.indicators.macd, heightPx: nextHeight },
-            },
-          }
-        }),
-    }),
+            }
+          }),
+        setMACDHeight: (height) =>
+          set((state) => {
+            const minHeight = 120
+            const maxHeight = Math.max(
+              minHeight,
+              Math.floor((typeof window !== "undefined" ? window.innerHeight : 600) * 0.5),
+            )
+            const nextHeight = Math.min(Math.max(Math.floor(height), minHeight), maxHeight)
+            return {
+              indicators: {
+                ...state.indicators,
+                macd: { ...state.indicators.macd, heightPx: nextHeight },
+              },
+            }
+          }),
+      }
+    },
     {
       name: "chart-store",
       partialize: (state) => ({

@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import {
   ColorType,
   HistogramSeries,
@@ -19,8 +19,9 @@ import type { CandleDTO } from "@/lib/api/types"
 import { intervalToSeconds, resolveCssColor, type Interval } from "@/lib/utils"
 import { computeMACD, type MACDPoint } from "@/lib/indicators/macd"
 import { useIndicatorMACD, type IndicatorValues } from "@/components/chart/hooks/use-indicator-macd"
-import { ilog, igroup, igroupEnd, diffRange } from "@/lib/debug/ilog"
+import { ilog, igroup, igroupEnd } from "@/lib/debug/ilog"
 import { buildGhostTimes, GHOST_PAD_BARS, toWhitespaceData } from "@/lib/chart/ghost"
+import { BASE_TIME_SCALE_OPTIONS, syncTimeScales } from "@/lib/chart/sync"
 
 export interface IndicatorChartControls {
   chart: IChartApi
@@ -105,7 +106,6 @@ export function IndicatorChart({ candles, interval, params, className, onReady, 
   const [isReady, setIsReady] = useState(false)
   const sizeOkRef = useRef(false)
   const resizeRafRef = useRef<number | null>(null)
-  const isSyncingRef = useRef(false)
   const lastSetDataAtRef = useRef(0)
 
   const macdControls = useIndicatorMACD({
@@ -113,6 +113,7 @@ export function IndicatorChart({ candles, interval, params, className, onReady, 
     params,
     chartRef,
     series: { macd: macdSeriesRef, signal: signalSeriesRef, hist: histSeriesRef },
+    ready: isReady,
   })
 
   useEffect(() => {
@@ -148,8 +149,8 @@ export function IndicatorChart({ candles, interval, params, className, onReady, 
 
         let chart = chartRef.current
         if (!chart) {
-          const textColor = resolveCssColor("hsl(var(--muted-foreground))")
-          const borderColor = resolveCssColor("hsl(var(--border))")
+          const axisTextColor = resolveCssColor("var(--chart-axis-text)")
+          const gridLineColor = resolveCssColor("var(--chart-grid-line)")
           const accentColor = resolveCssColor("hsl(var(--accent))")
 
           chart = createChart(container, {
@@ -157,14 +158,14 @@ export function IndicatorChart({ candles, interval, params, className, onReady, 
             height,
             layout: {
               background: { type: ColorType.Solid, color: backgroundColor },
-              textColor,
+              textColor: axisTextColor,
               fontSize: 12,
               fontFamily: "var(--font-geist-sans)",
               attributionLogo: false,
             },
             grid: {
-              vertLines: { visible: false, color: borderColor, style: LineStyle.Solid },
-              horzLines: { visible: true, color: borderColor, style: LineStyle.Solid },
+              vertLines: { visible: false, color: gridLineColor, style: LineStyle.Solid },
+              horzLines: { visible: true, color: gridLineColor, style: LineStyle.Solid },
             },
             crosshair: {
               mode: 1,
@@ -172,18 +173,18 @@ export function IndicatorChart({ candles, interval, params, className, onReady, 
               horzLine: { color: accentColor, width: 1, style: LineStyle.Solid },
             },
             rightPriceScale: {
-              borderColor,
-              textColor,
+              borderColor: gridLineColor,
+              textColor: axisTextColor,
               scaleMargins: { top: 0.1, bottom: 0.1 },
             },
             leftPriceScale: { visible: false },
             timeScale: {
-              visible: true,
+              ...BASE_TIME_SCALE_OPTIONS,
+              visible: false,
               borderVisible: false,
+              borderColor: gridLineColor,
               timeVisible: false,
               secondsVisible: false,
-              lockVisibleTimeRangeOnResize: true,
-              shiftVisibleRangeOnNewBar: false,
             },
             handleScroll: false,
             handleScale: false,
@@ -194,7 +195,7 @@ export function IndicatorChart({ candles, interval, params, className, onReady, 
           igroup("indic:createChart", { width, height })
           ilog("indic:create:options", {
             layout: "macd",
-            colors: { textColor, borderColor, accentColor },
+            colors: { textColor: axisTextColor, borderColor: gridLineColor, accentColor },
           })
 
           const ghostSeries = chart.addSeries(LineSeries, {
@@ -223,7 +224,7 @@ export function IndicatorChart({ candles, interval, params, className, onReady, 
 
           macdSeries.createPriceLine({
             price: 0,
-            color: borderColor,
+            color: gridLineColor,
             lineWidth: 1,
             lineStyle: LineStyle.Dotted,
             axisLabelVisible: true,
@@ -287,7 +288,6 @@ export function IndicatorChart({ candles, interval, params, className, onReady, 
       timeSyncCleanupRef.current?.()
       timeSyncCleanupRef.current = null
       linkedChartRef.current = null
-      isSyncingRef.current = false
       const chart = chartRef.current
       if (chart) {
         if (crosshairHandlerRef.current) {
@@ -306,110 +306,47 @@ export function IndicatorChart({ candles, interval, params, className, onReady, 
     }
   }, [onCrosshairMove, onReady])
 
-  const syncWith = useMemo(() => {
-  return (priceChart: IChartApi | null) => {
-    // cleanup previous sync
-    timeSyncCleanupRef.current?.();
-    timeSyncCleanupRef.current = null;
-    linkedChartRef.current = priceChart;
+  const syncWith = useCallback(
+    (priceChart: IChartApi | null) => {
+      timeSyncCleanupRef.current?.()
+      timeSyncCleanupRef.current = null
+      linkedChartRef.current = priceChart
 
-    const local = chartRef.current;
-    if (!local || !priceChart || !sizeOkRef.current) {
-      ilog("indic:sync:init:guard", {
-        hasLocal: !!local,
-        hasPrice: !!priceChart,
-        sizeOk: sizeOkRef.current,
-      });
-      return;
-    }
-
-    const to = local.timeScale();
-    const from = priceChart.timeScale();
-
-    // Try to mirror spacing/offset if the runtime exposes options (optional)
-    try {
-      const srcOpts = (from as any).getOptions?.();
-      if (srcOpts) {
-        to.applyOptions({
-          barSpacing: (srcOpts as any).barSpacing,
-          rightOffset: (srcOpts as any).rightOffset,
-        } as any);
+      const local = chartRef.current
+      if (!local || !priceChart || !sizeOkRef.current) {
+        ilog("indic:sync:init:guard", {
+          hasLocal: !!local,
+          hasPrice: !!priceChart,
+          sizeOk: sizeOkRef.current,
+        })
+        return
       }
-    } catch {}
 
-    let raf = 0;
-    const handler = () => {
-      if (raf) return;
-      raf = requestAnimationFrame(() => {
-        raf = 0;
+      const unsync = syncTimeScales(priceChart, local)
+      timeSyncCleanupRef.current = unsync
 
-        // ---- SYNC BY *TIME* RANGE (not logical) ----
-        const src = from.getVisibleRange?.();
-        const dst = to.getVisibleRange?.();
-
-        ilog("indic:sync:tick", { src, dst, diff: diffRange(dst as any, src as any) }, 16);
-        if (!src || !dst) return;
-
-        const same = src.from === (dst as any).from && src.to === (dst as any).to;
-        if (same) return;
-
-        isSyncingRef.current = true;
+      const sourceRange = priceChart.timeScale().getVisibleLogicalRange()
+      if (sourceRange) {
         try {
-          ilog("indic:sync:apply", { to: src });
-          to.setVisibleRange(src);
-
-          // Keep spacing/offset in lockstep when available (optional)
-          try {
-            const s = (from as any).getOptions?.();
-            if (s) {
-              to.applyOptions({
-                barSpacing: (s as any).barSpacing,
-                rightOffset: (s as any).rightOffset,
-              } as any);
-            }
-          } catch {}
-        } finally {
-          requestAnimationFrame(() => {
-            isSyncingRef.current = false;
-          });
+          local
+            .timeScale()
+            .setVisibleLogicalRange({ from: sourceRange.from, to: sourceRange.to })
+        } catch {
+          // ignore
         }
-      });
-    };
-
-    from.subscribeVisibleTimeRangeChange?.(handler);
-
-    // Seed initial range with TIME range (then optionally align logical)
-    const seed = from.getVisibleRange?.();
-    if (seed) {
-      ilog("indic:sync:seed", { seed });
-      isSyncingRef.current = true;
-      try {
-        to.setVisibleRange(seed);
-
-        // optional: also mirror current spacing/offset once
-        try {
-          const s = (from as any).getOptions?.();
-          if (s) {
-            to.applyOptions({
-              barSpacing: (s as any).barSpacing,
-              rightOffset: (s as any).rightOffset,
-            } as any);
-          }
-        } catch {}
-      } finally {
-        requestAnimationFrame(() => {
-          isSyncingRef.current = false;
-        });
       }
-    }
 
-    timeSyncCleanupRef.current = () => {
-      ilog("indic:sync:cleanup");
-      from.unsubscribeVisibleTimeRangeChange?.(handler);
-      if (raf) cancelAnimationFrame(raf);
-    };
-  };
-}, []);
+      const spacing = priceChart.timeScale().options().barSpacing
+      if (typeof spacing === "number") {
+        try {
+          local.timeScale().applyOptions({ barSpacing: spacing })
+        } catch {
+          // ignore
+        }
+      }
+    },
+    [chartRef, sizeOkRef],
+  )
 
 
   useEffect(() => {

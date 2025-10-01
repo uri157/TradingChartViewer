@@ -64,6 +64,9 @@ export function TopBar({ className, children }: TopBarProps) {
     removeEma,
     toggleMACD,
     setMACDParams,
+    zoomIn,
+    zoomOut,
+    chart,
   } = useChartStore()
   const { data: symbolIntervals } = useSymbolIntervals(symbol)
   const [emaInput, setEmaInput] = useState("")
@@ -267,10 +270,24 @@ export function TopBar({ className, children }: TopBarProps) {
 
       {/* Chart Controls */}
       <div className="flex items-center gap-1">
-        <Button variant="ghost" size="sm" className="h-8 w-8 p-0">
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={zoomIn}
+          disabled={!chart}
+          aria-label="Zoom in"
+          title="Zoom in"
+        >
           <ZoomIn className="h-4 w-4" />
         </Button>
-        <Button variant="ghost" size="sm" className="h-8 w-8 p-0">
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={zoomOut}
+          disabled={!chart}
+          aria-label="Zoom out"
+          title="Zoom out"
+        >
           <ZoomOut className="h-4 w-4" />
         </Button>
         <Button variant="ghost" size="sm" className="h-8 w-8 p-0">

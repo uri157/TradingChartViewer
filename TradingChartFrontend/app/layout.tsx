@@ -9,9 +9,8 @@ import { Toaster } from "@/components/ui/toaster"
 import { Suspense } from "react"
 
 export const metadata: Metadata = {
-  title: "TradingView Lite",
+  title: "TradingChart",
   description: "Professional trading chart application",
-  generator: "v0.app",
 }
 
 export default function RootLayout({
