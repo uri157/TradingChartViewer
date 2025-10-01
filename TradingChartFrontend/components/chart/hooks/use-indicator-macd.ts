@@ -30,6 +30,7 @@ interface UseIndicatorMACDOptions {
   params: MACDParams
   chartRef: MutableRefObject<IChartApi | null>
   series: SeriesRefs
+  ready: boolean
 }
 
 export interface IndicatorValues {
@@ -62,7 +63,7 @@ function buildHistogramPoint(time: number, value: number): HistogramData {
 }
 
 export function useIndicatorMACD(options: UseIndicatorMACDOptions): IndicatorMACDControls {
-  const { candles, params, chartRef, series } = options
+  const { candles, params, chartRef, series, ready } = options
   const macdSeriesRef = series.macd
   const signalSeriesRef = series.signal
   const histSeriesRef = series.hist
@@ -90,15 +91,20 @@ export function useIndicatorMACD(options: UseIndicatorMACDOptions): IndicatorMAC
   }, [params.fast, params.slow, params.signal])
 
   useEffect(() => {
-    const macdSeries = macdSeriesRef.current
-    const signalSeries = signalSeriesRef.current
-    const histSeries = histSeriesRef.current
     const cleanup = () => {
       if (xhairRafRef.current != null) {
         cancelAnimationFrame(xhairRafRef.current)
         xhairRafRef.current = null
       }
     }
+
+    if (!ready) {
+      return cleanup
+    }
+
+    const macdSeries = macdSeriesRef.current
+    const signalSeries = signalSeriesRef.current
+    const histSeries = histSeriesRef.current
 
     if (!macdSeries || !signalSeries || !histSeries) {
       return cleanup
@@ -398,7 +404,7 @@ export function useIndicatorMACD(options: UseIndicatorMACDOptions): IndicatorMAC
     }
 
     return cleanup
-  }, [candles, paramsMemo, macdSeriesRef, signalSeriesRef, histSeriesRef])
+  }, [candles, paramsMemo, ready, macdSeriesRef, signalSeriesRef, histSeriesRef])
 
   const findNearestTime = useCallback((t: number): number | null => {
     const arr = timesArrayRef.current

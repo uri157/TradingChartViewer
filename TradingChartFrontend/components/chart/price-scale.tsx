@@ -23,16 +23,5 @@ export function PriceScale({ currentPrice, symbol, className }: PriceScaleProps)
     })
   }
 
-  return (
-    <div className={cn("flex flex-col items-end justify-center bg-card border-l border-border", className)}>
-      {currentPrice && (
-        <div className="relative">
-          <Badge variant="default" className="bg-primary text-primary-foreground font-mono text-sm px-2 py-1">
-            ${formatPrice(currentPrice)}
-          </Badge>
-          <div className="absolute left-0 top-1/2 -translate-y-1/2 -translate-x-full w-2 h-px bg-primary" />
-        </div>
-      )}
-    </div>
-  )
+  
 }

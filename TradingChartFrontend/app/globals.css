@@ -40,6 +40,9 @@
   --sidebar-accent-foreground: oklch(0.95 0 0);
   --sidebar-border: oklch(0.25 0 0);
   --sidebar-ring: oklch(0.65 0.2 240);
+  /* Chart – Teal Muted variant (solo grid y axis text) */
+  --chart-grid-line: #1f3a37;
+  --chart-axis-text: #8fbfb6;
 }
 
 .dark {
@@ -78,6 +81,9 @@
   --sidebar-accent-foreground: oklch(0.95 0 0);
   --sidebar-border: oklch(0.25 0 0);
   --sidebar-ring: oklch(0.65 0.2 240);
+  /* Chart – Teal Muted variant (solo grid y axis text) */
+  --chart-grid-line: #1f3a37;
+  --chart-axis-text: #8fbfb6;
 }
 
 @theme inline {

@@ -1,18 +1,16 @@
 "use client"
 
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type MouseEvent as ReactMouseEvent,
-} from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import type { IChartApi } from "lightweight-charts"
 import { useSnapshot } from "@/lib/api/queries"
 import { useChartStore } from "@/lib/state/use-chart-store"
 import { useLiveData } from "@/hooks/use-live-data"
-import { CandleChart, type CandleChartControls } from "@/components/chart/candle-chart"
-import { IndicatorChart, type IndicatorChartControls } from "@/components/chart/indicator-chart"
+import { type CandleChartControls } from "@/components/chart/candle-chart"
+import { type IndicatorChartControls } from "@/components/chart/indicator-chart"
+import { ChartSplitLayout } from "@/components/chart/ChartSplitLayout"
+import { PriceChart, type PriceChartHandle } from "@/components/chart/PriceChart"
+import { MacdChart, type MacdChartHandle } from "@/components/chart/MacdChart"
+import { Button } from "@/components/ui/button"
 import { PriceScale } from "@/components/chart/price-scale"
 import { PairBadge } from "@/components/overlays/pair-badge"
 import { TopBar } from "@/components/header/top-bar"
@@ -21,9 +19,7 @@ import { MobileSymbolSheet } from "@/components/layout/mobile-symbol-sheet"
 import { LoadingState } from "@/components/feedback/loading-state"
 import { ErrorBanner } from "@/components/feedback/error-banner"
 import { useMobile } from "@/hooks/use-mobile"
-import { Button } from "@/components/ui/button"
 import { X } from "lucide-react"
-import { clamp } from "@/lib/utils"
 import { ilog, igroup, igroupEnd } from "@/lib/debug/ilog"
 import type { CandleDTO } from "@/lib/api/types"
 
@@ -34,6 +30,11 @@ const logDebug = (...args: unknown[]) => {
     // eslint-disable-next-line no-console
     console.debug(...args)
   }
+}
+
+const isAtRightEdge = (timeScale: ReturnType<IChartApi["timeScale"]>) => {
+  const position = timeScale.scrollPosition()
+  return position !== null && position > -0.5 && position < 0.5
 }
 
 function findCandleIndexByTime(candles: CandleDTO[], time: number): number {
@@ -86,17 +87,14 @@ export function ChartPage() {
   const interval = useChartStore((state) => state.interval)
   const macd = useChartStore((state) => state.indicators.macd)
   const hideMACD = useChartStore((state) => state.hideMACD)
-  const setMACDHeight = useChartStore((state) => state.setMACDHeight)
   const [currentPrice, setCurrentPrice] = useState<number | null>(null)
   const [priceControls, setPriceControls] = useState<CandleChartControls | null>(null)
   const [indicatorControls, setIndicatorControls] = useState<IndicatorChartControls | null>(null)
-  const [isResizingIndicator, setIsResizingIndicator] = useState(false)
   const [mergedCandles, setMergedCandles] = useState<CandleDTO[]>([])
   const [hydrated, setHydrated] = useState(false)
   const mergedContextRef = useRef<{ symbol: string; interval: string }>({ symbol, interval })
-  const resizeStartYRef = useRef(0)
-  const resizeStartHeightRef = useRef(0)
-  const resizeRafRef = useRef<number | null>(null)
+  const priceChartHandleRef = useRef<PriceChartHandle | null>(null)
+  const macdChartHandleRef = useRef<MacdChartHandle | null>(null)
   const isCrosshairActiveRef = useRef(false)
   const crosshairSyncingRef = useRef(false)
   const isMobile = useMobile()
@@ -129,6 +127,24 @@ export function ChartPage() {
     indicatorCandles.length && indicatorCandles[indicatorCandles.length - 1]
       ? Number(indicatorCandles[indicatorCandles.length - 1]?.c)
       : null
+
+  const handleAutoStickRequest = useCallback(
+    (chart: IChartApi) => {
+      const priceScale = chart.timeScale()
+      const indicatorChart = indicatorControls?.chart ?? null
+      if (!indicatorChart) {
+        priceScale.scrollToRealTime()
+        return
+      }
+
+      const indicatorScale = indicatorChart.timeScale()
+      if (isAtRightEdge(priceScale) && isAtRightEdge(indicatorScale)) {
+        priceScale.scrollToRealTime()
+        indicatorScale.scrollToRealTime()
+      }
+    },
+    [indicatorControls],
+  )
 
   const handleLiveAppend = useCallback(
     (candle: CandleDTO) => {
@@ -193,10 +209,6 @@ export function ChartPage() {
   useEffect(() => {
     ilog("page:macdVisibility", { visible: macd.visible })
   }, [macd.visible])
-
-  useEffect(() => {
-    ilog("page:macdHeight", { h: macd.heightPx }, 50)
-  }, [macd.heightPx])
 
   // useEffect(() => {
   //   if (!isDebug()) return
@@ -281,59 +293,6 @@ export function ChartPage() {
     igroupEnd()
   }, [indicatorControls, priceControls])
 
-  const handleResizeStart = useCallback(
-    (event: ReactMouseEvent<HTMLDivElement>) => {
-      event.preventDefault()
-      resizeStartYRef.current = event.clientY
-      resizeStartHeightRef.current = macd.heightPx
-      setIsResizingIndicator(true)
-    },
-    [macd.heightPx],
-  )
-
-  useEffect(() => {
-    if (!isResizingIndicator) return
-
-    const handleMouseMove = (event: MouseEvent) => {
-      if (resizeRafRef.current != null) {
-        return
-      }
-
-      const clientY = event.clientY
-      resizeRafRef.current = requestAnimationFrame(() => {
-        resizeRafRef.current = null
-        const delta = clientY - resizeStartYRef.current
-        const windowHeight = typeof window !== "undefined" ? window.innerHeight : resizeStartHeightRef.current
-        const maxHeight = Math.max(120, Math.floor(windowHeight * 0.6))
-        const next = clamp(resizeStartHeightRef.current + delta, 120, maxHeight)
-        ilog("page:resize:move", { next }, 33)
-        setMACDHeight(next)
-      })
-    }
-
-    const handleMouseUp = () => {
-      setIsResizingIndicator(false)
-    }
-
-    window.addEventListener("mousemove", handleMouseMove)
-    window.addEventListener("mouseup", handleMouseUp)
-
-    return () => {
-      window.removeEventListener("mousemove", handleMouseMove)
-      window.removeEventListener("mouseup", handleMouseUp)
-      if (resizeRafRef.current != null) {
-        cancelAnimationFrame(resizeRafRef.current)
-        resizeRafRef.current = null
-      }
-    }
-  }, [isResizingIndicator, setMACDHeight])
-
-  useEffect(() => {
-    if (!macd.visible) {
-      setIsResizingIndicator(false)
-    }
-  }, [macd.visible])
-
   const fallbackPrice =
     typeof lastClose === "number" && Number.isFinite(lastClose) ? lastClose : null
 
@@ -373,13 +332,60 @@ export function ChartPage() {
                     <LoadingState message="Loading chart..." />
                   ) : hasCandles ? (
                     <>
-                      <CandleChart
-                        data={snapshot?.candles ?? []}
-                        interval={interval}
-                        className="h-full"
-                        onCrosshairMove={handlePriceCrosshair}
-                        onReady={setPriceControls}
-                      />
+                      {macd.visible ? (
+                        <ChartSplitLayout
+                          className="absolute inset-0"
+                          pricePane={
+                            <div className="relative h-full bg-card">
+                              <PriceChart
+                                ref={priceChartHandleRef}
+                                data={snapshot?.candles ?? []}
+                                interval={interval}
+                                className="absolute inset-0"
+                                onCrosshairMove={handlePriceCrosshair}
+                                onReady={setPriceControls}
+                                onRequestAutoStick={handleAutoStickRequest}
+                              />
+                            </div>
+                          }
+                          macdPane={
+                            <div className="relative h-full bg-card overflow-hidden">
+                              <MacdChart
+                                ref={macdChartHandleRef}
+                                candles={indicatorCandles}
+                                interval={interval}
+                                params={{ fast: macd.fast, slow: macd.slow, signal: macd.signal }}
+                                onCrosshairMove={handleIndicatorCrosshair}
+                                onReady={setIndicatorControls}
+                                className="absolute inset-0"
+                              />
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                onClick={hideMACD}
+                                className="absolute right-2 top-2 z-20 h-8 w-8 rounded-full bg-background/80 hover:bg-background"
+                                aria-label="Hide MACD"
+                              >
+                                <X className="h-4 w-4" />
+                              </Button>
+                            </div>
+                          }
+                          priceChartRef={priceChartHandleRef}
+                          macdChartRef={macdChartHandleRef}
+                        />
+                      ) : (
+                        <div className="absolute inset-0 bg-card">
+                          <PriceChart
+                            ref={priceChartHandleRef}
+                            data={snapshot?.candles ?? []}
+                            interval={interval}
+                            className="absolute inset-0"
+                            onCrosshairMove={handlePriceCrosshair}
+                            onReady={setPriceControls}
+                            onRequestAutoStick={handleAutoStickRequest}
+                          />
+                        </div>
+                      )}
                       <PairBadge symbol={symbol} interval={interval} />
                     </>
                   ) : (
@@ -388,36 +394,6 @@ export function ChartPage() {
                     </div>
                   )}
                 </div>
-                {macd.visible && (
-                  <>
-                    <div
-                      className="h-1 cursor-row-resize bg-border/40 hover:bg-border transition-colors"
-                      onMouseDown={handleResizeStart}
-                    />
-                    <div
-                      className="relative bg-card overflow-hidden min-h-[120px]"
-                      style={{ height: macd.heightPx }}
-                    >
-                      <IndicatorChart
-                        candles={indicatorCandles}
-                        interval={interval}
-                        params={{ fast: macd.fast, slow: macd.slow, signal: macd.signal }}
-                        onCrosshairMove={handleIndicatorCrosshair}
-                        onReady={setIndicatorControls}
-                        className="absolute inset-0"
-                      />
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        onClick={hideMACD}
-                        className="absolute right-2 top-2 z-10 h-8 w-8 rounded-full bg-background/80 hover:bg-background"
-                        aria-label="Hide MACD"
-                      >
-                        <X className="h-4 w-4" />
-                      </Button>
-                    </div>
-                  </>
-                )}
               </div>
               <PriceScale
                 currentPrice={currentPrice ?? fallbackPrice}
